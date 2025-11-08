@@ -4,7 +4,7 @@ pragma solidity >=0.8.25;
 import {Ownable} from "../lib/openzeppelin-contracts/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "../lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 
-contract DataCommonsGovernance is Ownable, ReentrancyGuard {
+contract DataCommonsDAO is Ownable, ReentrancyGuard {
     uint16 public constant BASIS_POINTS = 10000; // 100.00%
 
     enum Phase {
