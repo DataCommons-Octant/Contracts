@@ -5,13 +5,14 @@ import "../lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import "../lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 import "../lib/openzeppelin-contracts/contracts/access/Ownable.sol";
 
-contract DataCommonDAO is ReentrancyGuard, Ownable {
+contract dataCommonsDAO is ReentrancyGuard, Ownable(msg.sender) {
     IERC20 public immutable stakedToken; // token staked by user
 
     uint256 applicationStartTime;
     uint256 applicationEndTime;
     uint256 votingStartTime;
     uint256 votingEndTime;
+    bool public snapshotTaken = false;
 
     // Check the code once, since u said me, that times must not collidde of application time and voting time
     uint256 nextApplicationId;
@@ -45,12 +46,12 @@ contract DataCommonDAO is ReentrancyGuard, Ownable {
     uint256 public totalApprovedYesWeight; // Sum of yesWeight for all approved apps
 
     constructor(IERC20 _stakedToken) {
-        stackedToken = _stakedToken;
+        stakedToken = _stakedToken;
         nextApplicationId = 1;
     }
 
     // EVENTS
-    event applicationTimeSet(uint256 startTime, uint256 endTime);
+    event ApplicationTimeSet(uint256 startTime, uint256 endTime);
     event votingTimeSet(uint256 startTime, uint256 endTime);
     event VotingStarted(uint256 timestamp, uint256 totalVotingPower);
     event amountDeposited(address indexed staker, uint256 amount);
@@ -60,6 +61,11 @@ contract DataCommonDAO is ReentrancyGuard, Ownable {
         address indexed voter,
         bool support,
         uint256 votingPower
+    );
+    event ApplicationSubmitted(
+        uint256 indexed id,
+        address indexed applicant,
+        string ipfsURI
     );
 
     // sabse pehle application time set karna hoga
@@ -78,25 +84,26 @@ contract DataCommonDAO is ReentrancyGuard, Ownable {
     error VotingPhaseNotGoingOn();
     error AlreadyVoted();
     error NoVotingPower();
+    error SnapshotAlreadyTaken();
 
     function setApplicationRange(
         uint256 _start,
         uint256 _end
     ) external onlyOwner {
-        if (_start > _end) {
-            revert InvalidTimeRange();
-        }
-        if (_end > votingStartTime) {
+        if (votingStartTime != 0 && _end > votingStartTime) {
             revert ApplicationAndVotingTimeOverlap();
         }
         applicationStartTime = _start;
         applicationEndTime = _end;
 
-        emit applicationTimeSet(_start, _end);
+        emit ApplicationTimeSet(_start, _end);
     }
 
     function setVotingRange(uint256 _start, uint256 _end) external onlyOwner {
         if (_start > _end) {
+            revert InvalidTimeRange();
+        }
+        if (applicationEndTime == 0) {
             revert InvalidTimeRange();
         }
         if (_start < applicationEndTime) {
@@ -108,27 +115,30 @@ contract DataCommonDAO is ReentrancyGuard, Ownable {
     }
 
     function startTheVotingNow() external onlyOwner {
-        // voting woud be start by owner only
-        if (applicationStartTime == 0) {
-            revert InvalidTimeRange();
-        }
-        if (block.timestamp < applicationEndTime) {
+        // Basic sanity checks
+        if (
+            applicationEndTime == 0 ||
+            votingStartTime == 0 ||
+            votingEndTime == 0
+        ) revert VotingPhaseNotSet();
+        // Ensure application period finished
+        if (block.timestamp < applicationEndTime)
             revert ApplicationPeriodNotOver();
-        }
-
-        if (votingPhaseStart <= 0) {
-            revert VotingPhaseNotSet();
-        }
+        // Ensure current time is at-or-after voting start
+        if (block.timestamp < votingStartTime) revert VotingPhaseNotSet();
+        // Prevent double snapshot
+        if (snapshotTaken) revert SnapshotAlreadyTaken();
 
         _snapshotStakes();
-        emit VotingStarted(block.timestamp, totalSnapshotVotingPower); //time at which, voting started | total voting power
+        snapshotTaken = true;
+        emit VotingStarted(block.timestamp, totalSnapshotVotingPower);
     }
 
     // continuously application phase is going on, only we create function, to start voting phase
 
     modifier applicationPhaseGoingOnOrNot() {
         if (
-            applicationStartTime > 0 &&
+            applicationStartTime != 0 &&
             block.timestamp >= applicationStartTime &&
             block.timestamp <= applicationEndTime
         ) {
@@ -141,7 +151,7 @@ contract DataCommonDAO is ReentrancyGuard, Ownable {
     function submitApplication(
         string calldata _ipfsURI
     ) external applicationPhaseGoingOnOrNot {
-        if (_ipfsURI.length == 0) {
+        if (bytes(_ipfsURI).length == 0) {
             revert IPFSuriCannotBeEmpty();
         }
         uint256 appId = nextApplicationId;
@@ -158,16 +168,18 @@ contract DataCommonDAO is ReentrancyGuard, Ownable {
             approved: false,
             yieldShareBasisPoints: 0
         });
+
+        applications[appId] = newApp;
         applicationIds.push(appId);
 
-        // Event emmited has to be written, u write it, am getting confused
+        emit ApplicationSubmitted(appId, msg.sender, _ipfsURI);
     }
 
     function getApplication(
         uint256 id
     ) external view returns (Application memory) {
-        if (application[id].exists) {
-            Application memory app = applications[idx];
+        if (applications[id].exists) {
+            Application memory app = applications[id];
             return app;
         } else {
             revert ApplicationDoesNotExist();
@@ -221,7 +233,7 @@ contract DataCommonDAO is ReentrancyGuard, Ownable {
 
         for (uint256 i = 0; i < stakers.length; i++) {
             address staker = stakers[i];
-            uint256 balance = staker[staker];
+            uint256 balance = staked[staker];
             snapshotBalance[staker] = balance;
             total += balance;
         }
@@ -251,6 +263,7 @@ contract DataCommonDAO is ReentrancyGuard, Ownable {
         if (votingPower == 0) {
             revert NoVotingPower();
         }
+        hasVoted[applicationId][msg.sender] = true;
         if (support) {
             applications[applicationId].yesWeight += votingPower;
         } else {
@@ -258,24 +271,4 @@ contract DataCommonDAO is ReentrancyGuard, Ownable {
         }
         emit voted(applicationId, msg.sender, support, votingPower);
     }
-
-    //  RESULTS
-
-    // GENERATED BY AI(COMMENTS ONLY)(For you to understand the logic we would be applying for calculating results)
-    /**
-     * @notice Finalize voting results and calculate proportional yield shares
-     * @dev Called by owner after voting ends. Implements Method A allocation.
-     *
-     * LOGIC:
-     * 1. Approve all applications where yesWeight > noWeight
-     * 2. Calculate total YES weight from all approved apps
-     * 3. Each approved app gets: (app.yesWeight / totalApprovedYesWeight) * 100%
-     * 4. Store shares in basis points (10000 = 100%)
-     *
-     * EXAMPLE:
-     * - App 1: 1000 YES → 50% share (5000 basis points)
-     * - App 2: 600 YES → 30% share (3000 basis points)
-     * - App 3: 400 YES → 20% share (2000 basis points)
-     * - Total: 2000 YES votes = 100% of yield
-     */
 }
