@@ -1,274 +1,443 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity >=0.8.25;
 
-import "../lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
-import "../lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
-import "../lib/openzeppelin-contracts/contracts/access/Ownable.sol";
+import {Ownable} from "../lib/openzeppelin-contracts/contracts/access/Ownable.sol";
+import {ReentrancyGuard} from "../lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 
-contract dataCommonsDAO is ReentrancyGuard, Ownable(msg.sender) {
-    IERC20 public immutable stakedToken; // token staked by user
+contract DataCommonsGovernance is Ownable, ReentrancyGuard {
+    uint16 public constant BASIS_POINTS = 10000; // 100.00%
 
-    uint256 applicationStartTime;
-    uint256 applicationEndTime;
-    uint256 votingStartTime;
-    uint256 votingEndTime;
-    bool public snapshotTaken = false;
+    enum Phase {
+        Idle,
+        Application,
+        Voting,
+        Finalized
+    } // governance phases
 
-    // Check the code once, since u said me, that times must not collidde of application time and voting time
-    uint256 nextApplicationId;
-    bool public resultDeclaredOrNot = false; // To know, when the results are declared
-
+    /**
+     * @notice Struct representing an application submitted by an applicant
+     * @param applicant Address of the applicant
+     * @param index Numeric index chosen by the applicant
+     * @param ipfsUri IPFS URI containing detailed application data
+     * @param exists Boolean indicating if the application exists
+     */
     struct Application {
-        uint256 id; // unique id
-        address applicant; // address
-        string ipfsURI; // IPFS link to full application JSON
-        uint256 yesWeight; // total yesses in favour
-        uint256 noWeight; // total nos against
-        bool exists; // if application exists (I am putting this, in case, if user withdraws its application..)
-        bool approved; //  if approved or not
-        uint256 yieldShareBasisPoints; // share of it
+        address applicant;
+        uint256 index;
+        string ipfsUri;
+        bool exists;
     }
+
+    // input from voters: list of applicant indices + assigned shares in basis points
+    struct VoteSubmission {
+        uint256[] indices;
+        uint256[] shares; // basis points per index (not required to sum to BASIS_POINTS)
+    }
+
+    /**
+     * @notice Struct representing a winning application
+     * @param index Numeric index of the winning application
+     * @param applicant Address of the winning applicant
+     * @param normalizedShare Normalized share in basis points (sums to BASIS_POINTS across winners)
+     * @param rawScore Aggregated raw score before normalization
+     */
+    struct Winner {
+        uint256 index;
+        address applicant;
+        uint256 normalizedShare;
+        uint256 rawScore;
+    }
+
+    // Parameters
+    uint256 public applicationStart; // timestamp at which applications open
+    uint256 public applicationEnd; // timestamp at which applications close
+    uint256 public votingEnd; // timestamp at which voting ends
+    uint256 public maxWinners; // max number of winners to select
+    uint256 public maxApplications; // max number of applications (0 = unlimited)
+
+    Phase public phase;
 
     mapping(uint256 => Application) public applications;
-    uint256[] public applicationIds; // List of all submitted application IDs
-    mapping(address => uint256) public staked; //User -> How much. stacked
-    address[] public stakers; // List of all stakers
-    mapping(address => bool) private isStaker; // staker or not
-    mapping(address => uint256) public snapshotBalance; // Voting power per user
-    uint256 public totalSnapshotVotingPower; // Total voting power
+    uint256 public applicationCount;
 
-    // Vote tracking
-    mapping(uint256 => mapping(address => bool)) public hasVoted; // appId => voter adddress => voted or not
-    // means, has this paritcular application id, been voted by this address or not
+    mapping(address => bool) public isApplicantRegistered; // Track if an address is registered as applicant (prevents duplicate indexed entries)
+    mapping(uint256 => uint256) public aggregatedScores; // Votes: per applicant index aggregated from all voters (raw score)
+    mapping(address => bool) public hasVoted; // Track whether a voter has cast their vote for this epoch
+    mapping(address => VoteSubmission) internal submissions; // Store each voter's submission (optional retrieval)
 
-    // Results
-    uint256[] public approvedApplicationIds; // List of approved application IDs
-    uint256 public totalApprovedYesWeight; // Sum of yesWeight for all approved apps
+    Winner[] public winners; // Winners computed after finalization
+    bool public resultsFinalized;
 
-    constructor(IERC20 _stakedToken) {
-        stakedToken = _stakedToken;
-        nextApplicationId = 1;
-    }
-
-    // EVENTS
-    event ApplicationTimeSet(uint256 startTime, uint256 endTime);
-    event votingTimeSet(uint256 startTime, uint256 endTime);
-    event VotingStarted(uint256 timestamp, uint256 totalVotingPower);
-    event amountDeposited(address indexed staker, uint256 amount);
-    event withdrawn(address indexed staker, uint256 amount);
-    event voted(
-        uint256 indexed applicationId,
-        address indexed voter,
-        bool support,
-        uint256 votingPower
-    );
+    // Events
     event ApplicationSubmitted(
-        uint256 indexed id,
+        uint256 indexed index,
         address indexed applicant,
-        string ipfsURI
+        string ipfsUri
     );
+    event ApplicationRemoved(uint256 indexed index, address indexed applicant);
+    event VoteCast(address indexed voter, uint256[] indices, uint256[] shares);
+    event ResultsFinalized(uint256 indexed timestamp);
+    event PhaseUpdated(Phase newPhase);
 
-    // sabse pehle application time set karna hoga
-    // then, voting begins
+    // Errors
+    error Not_In_Phase(Phase expected);
+    error Already_Registered();
+    error Not_Registered();
+    error Invalid_Input();
+    error Already_Voted();
+    error Invalid_Phase_Transition();
 
-    // CUSTOM ERRORS
-    error InvalidTimeRange();
-    error ApplicationAndVotingTimeOverlap();
-    error ApplicationPeriodNotOver();
-    error VotingPhaseNotSet();
-    error IPFSuriCannotBeEmpty();
-    error ApplicationDoesNotExist();
-    error AmountMustBeGreaterThanZero();
-    error TransferFailed(address from, address to, uint256 amount);
-    error InsufficientStakedBalance();
-    error VotingPhaseNotGoingOn();
-    error AlreadyVoted();
-    error NoVotingPower();
-    error SnapshotAlreadyTaken();
+    /**
+     * @notice Constructor to initialize the DataCommonsGovernance contract
+     * @param _applicationStart Timestamp when the application phase starts
+     * @param _applicationEnd Timestamp when the application phase ends
+     * @param _votingEnd Timestamp when the voting phase ends
+     * @param _maxWinners Maximum number of winners to select
+     * @param _maxApplications Maximum number of applications allowed (0 for unlimited)
+     */
+    constructor(
+        uint256 _applicationStart,
+        uint256 _applicationEnd,
+        uint256 _votingEnd,
+        uint256 _maxWinners,
+        uint256 _maxApplications
+    ) Ownable(msg.sender) {
+        require(_applicationStart < _applicationEnd, "start < end");
+        require(_applicationEnd < _votingEnd, "app end < vote end");
+        require(_maxWinners > 0, "K>0");
 
-    function setApplicationRange(
-        uint256 _start,
-        uint256 _end
+        applicationStart = _applicationStart;
+        applicationEnd = _applicationEnd;
+        votingEnd = _votingEnd;
+        maxWinners = _maxWinners;
+        maxApplications = _maxApplications;
+
+        phase = Phase.Idle;
+    }
+
+    /**
+     * @notice Starts the application phase
+     * @dev Can only be called by the contract owner before the application start time
+     */
+    function startApplicationPhase() external onlyOwner {
+        require(block.timestamp <= applicationStart, "too late to start");
+        phase = Phase.Application;
+        emit PhaseUpdated(phase);
+    }
+
+    /**
+     * @notice Starts the voting phase
+     * @dev Can only be called by the contract owner after the application end time
+     */
+    function startVotingPhase() external onlyOwner {
+        // allow starting voting only after application end time
+        require(block.timestamp >= applicationEnd, "application not ended");
+        phase = Phase.Voting;
+        emit PhaseUpdated(phase);
+    }
+
+    /**
+     * @notice Updates the application and voting periods
+     * @dev Can only be called by the contract owner
+     * @param _applicationStart New timestamp for application start
+     * @param _applicationEnd New timestamp for application end
+     * @param _votingEnd New timestamp for voting end
+     */
+    function updateApplicationPeriod(
+        uint256 _applicationStart,
+        uint256 _applicationEnd,
+        uint256 _votingEnd
     ) external onlyOwner {
-        if (votingStartTime != 0 && _end > votingStartTime) {
-            revert ApplicationAndVotingTimeOverlap();
-        }
-        applicationStartTime = _start;
-        applicationEndTime = _end;
-
-        emit ApplicationTimeSet(_start, _end);
+        require(
+            _applicationStart < _applicationEnd && _applicationEnd < _votingEnd,
+            "bad times"
+        );
+        applicationStart = _applicationStart;
+        applicationEnd = _applicationEnd;
+        votingEnd = _votingEnd;
     }
 
-    function setVotingRange(uint256 _start, uint256 _end) external onlyOwner {
-        if (_start > _end) {
-            revert InvalidTimeRange();
-        }
-        if (applicationEndTime == 0) {
-            revert InvalidTimeRange();
-        }
-        if (_start < applicationEndTime) {
-            revert ApplicationAndVotingTimeOverlap();
-        }
-        votingStartTime = _start;
-        votingEndTime = _end;
-        emit votingTimeSet(_start, _end);
+    /**
+     * @notice Sets the maximum number of winners
+     * @dev Can only be called by the contract owner
+     * @param _maxWinners New maximum number of winners
+     */
+    function setMaxWinners(uint256 _maxWinners) external onlyOwner {
+        require(_maxWinners > 0, "K>0");
+        maxWinners = _maxWinners;
     }
 
-    function startTheVotingNow() external onlyOwner {
-        // Basic sanity checks
-        if (
-            applicationEndTime == 0 ||
-            votingStartTime == 0 ||
-            votingEndTime == 0
-        ) revert VotingPhaseNotSet();
-        // Ensure application period finished
-        if (block.timestamp < applicationEndTime)
-            revert ApplicationPeriodNotOver();
-        // Ensure current time is at-or-after voting start
-        if (block.timestamp < votingStartTime) revert VotingPhaseNotSet();
-        // Prevent double snapshot
-        if (snapshotTaken) revert SnapshotAlreadyTaken();
-
-        _snapshotStakes();
-        snapshotTaken = true;
-        emit VotingStarted(block.timestamp, totalSnapshotVotingPower);
+    /**
+     * @notice Modifier to restrict functions to the application phase
+     */
+    modifier onlyDuringApplication() {
+        if (phase != Phase.Application) revert Not_In_Phase(Phase.Application);
+        _;
     }
 
-    // continuously application phase is going on, only we create function, to start voting phase
-
-    modifier applicationPhaseGoingOnOrNot() {
-        if (
-            applicationStartTime != 0 &&
-            block.timestamp >= applicationStartTime &&
-            block.timestamp <= applicationEndTime
-        ) {
-            _;
-        } else {
-            revert ApplicationPeriodNotOver();
-        }
-    }
-
+    /**
+     * @notice Submit an application during the application phase
+     * @param _index Numeric index chosen by the applicant
+     * @param _ipfsUri IPFS URI containing detailed application data
+     */
     function submitApplication(
-        string calldata _ipfsURI
-    ) external applicationPhaseGoingOnOrNot {
-        if (bytes(_ipfsURI).length == 0) {
-            revert IPFSuriCannotBeEmpty();
-        }
-        uint256 appId = nextApplicationId;
-        nextApplicationId++;
+        uint256 _index,
+        string calldata _ipfsUri
+    ) external onlyDuringApplication {
+        if (isApplicantRegistered[msg.sender]) revert Already_Registered();
+        if (bytes(_ipfsUri).length == 0) revert Invalid_Input();
+        if (maxApplications > 0 && applicationCount >= maxApplications)
+            revert Invalid_Input();
+        if (applications[_index].exists) revert Invalid_Input();
 
-        // Check THIS once
-        Application memory newApp = Application({
-            id: appId,
+        Application memory a = Application({
             applicant: msg.sender,
-            ipfsURI: _ipfsURI,
-            yesWeight: 0,
-            noWeight: 0,
-            exists: true,
-            approved: false,
-            yieldShareBasisPoints: 0
+            index: _index,
+            ipfsUri: _ipfsUri,
+            exists: true
         });
 
-        applications[appId] = newApp;
-        applicationIds.push(appId);
+        applications[_index] = a;
+        isApplicantRegistered[msg.sender] = true;
+        applicationCount++;
 
-        emit ApplicationSubmitted(appId, msg.sender, _ipfsURI);
+        emit ApplicationSubmitted(_index, msg.sender, _ipfsUri);
     }
 
-    function getApplication(
-        uint256 id
-    ) external view returns (Application memory) {
-        if (applications[id].exists) {
-            Application memory app = applications[id];
-            return app;
+    /**
+     * @notice Remove an application during the application phase
+     * @param _index Numeric index of the application to remove
+     */
+    function removeApplication(uint256 _index) external onlyDuringApplication {
+        Application storage a = applications[_index];
+        if (!a.exists) revert Not_Registered();
+        if (a.applicant != msg.sender && owner() != msg.sender)
+            revert Invalid_Input();
+
+        delete applications[_index];
+        isApplicantRegistered[a.applicant] = false;
+        applicationCount--;
+        emit ApplicationRemoved(_index, a.applicant);
+    }
+
+    /**
+     * @notice Modifier to restrict functions to the voting phase
+     */
+    modifier onlyDuringVoting() {
+        if (phase != Phase.Voting) revert Not_In_Phase(Phase.Voting);
+        _;
+    }
+
+    /**
+     * @notice Cast votes during the voting phase
+     * @param _indices Array of applicant indices being voted for
+     * @param _shares Array of shares in basis points assigned to each index
+     */
+    function castVote(
+        uint256[] calldata _indices,
+        uint256[] calldata _shares
+    ) external onlyDuringVoting nonReentrant {
+        if (_indices.length == 0 || _indices.length != _shares.length)
+            revert Invalid_Input();
+        if (hasVoted[msg.sender]) revert Already_Voted();
+
+        // validate indices
+        for (uint256 i = 0; i < _indices.length; ++i) {
+            uint256 idx = _indices[i];
+            if (!applications[idx].exists) revert Invalid_Input();
+            // accumulate raw score for each index
+            aggregatedScores[idx] += _shares[i];
+        }
+
+        submissions[msg.sender] = VoteSubmission({
+            indices: _indices,
+            shares: _shares
+        });
+        hasVoted[msg.sender] = true;
+
+        emit VoteCast(msg.sender, _indices, _shares);
+    }
+
+    /**
+     * @notice Finalizes the results after the voting phase
+     * @dev Can only be called after the voting end time
+     */
+    function finalizeResults() external nonReentrant {
+        if (phase != Phase.Voting) revert Not_In_Phase(Phase.Voting);
+        require(block.timestamp >= votingEnd, "voting still ongoing");
+        require(!resultsFinalized, "already finalized");
+
+        // collect applicants list into array
+        uint256 totalApps = 0;
+        // first pass: determine how many valid application entries exist
+        // We'll iterate over application indices by keeping a dynamic array of seen indices. Since applicants may choose arbitrary indices,
+        // we must scan mappings; to keep on-chain iteration feasible, we assume that front-end enforces a reasonable index space or registers indices sequentially.
+        // For a simple implementation, we'll collect indices by scanning up to a max range derived from applicationCount.
+
+        // To avoid expensive unbounded loops, we'll require that applications use sequential indices starting from 1..N
+        // (front-end or factory should enforce). We'll attempt to read 1..(applicationCountMaxIndex)
+
+        // Build a vector of candidate indices
+        uint256[] memory candidateIndices = new uint256[](applicationCount);
+        uint256 ptr = 0;
+        // naive scan: look for indices starting from 1 upward until we collect applicationCount entries
+        uint256 scanIdx = 1;
+        while (ptr < applicationCount) {
+            if (applications[scanIdx].exists) {
+                candidateIndices[ptr] = scanIdx;
+                ptr++;
+            }
+            scanIdx++;
+            // safety: if scanIdx grows very large, break (shouldn't happen if front-end enforces indices)
+            require(
+                scanIdx <= applicationCount + 10000,
+                "index space too sparse"
+            );
+        }
+
+        // Now we have candidateIndices[0..applicationCount-1]
+        // Sort candidates by aggregatedScores descending and pick top K
+        // Implement simple selection sort for top K (gas expensive for huge counts but acceptable for small application pools)
+
+        uint256 K = maxWinners;
+        if (K > applicationCount) K = applicationCount;
+
+        // arrays to hold top indices and their scores
+        uint256[] memory topIndices = new uint256[](K);
+        uint256[] memory topScores = new uint256[](K);
+
+        for (uint256 i = 0; i < applicationCount; ++i) {
+            uint256 idx = candidateIndices[i];
+            uint256 score = aggregatedScores[idx];
+
+            // try to place this candidate in top K
+            for (uint256 j = 0; j < K; ++j) {
+                if (score == 0 && topScores[j] == 0) {
+                    // both zero, skip placement but allow later
+                    break;
+                }
+                if (score > topScores[j]) {
+                    // shift down
+                    for (uint256 s = K - 1; s > j; --s) {
+                        topScores[s] = topScores[s - 1];
+                        topIndices[s] = topIndices[s - 1];
+                    }
+                    // insert
+                    topScores[j] = score;
+                    topIndices[j] = idx;
+                    break;
+                }
+                // handle if topScores[j]==0 and we've reached end
+                if (j == K - 1 && topScores[j] == 0) {
+                    topScores[j] = score;
+                    topIndices[j] = idx;
+                }
+            }
+        }
+
+        // compute total score among selected winners
+        uint256 totalWinnerScore = 0;
+        for (uint256 i = 0; i < K; ++i) {
+            totalWinnerScore += topScores[i];
+        }
+
+        // Edge case: if totalWinnerScore == 0 (no votes cast or all zero), we pick first K applicants by index and assign equal shares
+        winners = new Winner[](K);
+        if (totalWinnerScore == 0) {
+            uint256 equalShare = BASIS_POINTS / K; // integer division
+            for (uint256 i = 0; i < K; ++i) {
+                uint256 idx = candidateIndices[i];
+                winners[i] = Winner({
+                    index: idx,
+                    applicant: applications[idx].applicant,
+                    normalizedShare: equalShare,
+                    rawScore: 0
+                });
+            }
+            // adjust rounding for last winner
+            uint256 remainder = BASIS_POINTS - (equalShare * K);
+            if (remainder > 0) {
+                winners[0].normalizedShare += remainder;
+            }
         } else {
-            revert ApplicationDoesNotExist();
+            // normalize shares proportionally to raw score
+            uint256 accumulatedBP = 0;
+            for (uint256 i = 0; i < K; ++i) {
+                uint256 idx = topIndices[i];
+                uint256 raw = topScores[i];
+                uint256 bp = (raw * BASIS_POINTS) / totalWinnerScore; // truncated
+                winners[i] = Winner({
+                    index: idx,
+                    applicant: applications[idx].applicant,
+                    normalizedShare: bp,
+                    rawScore: raw
+                });
+                accumulatedBP += bp;
+            }
+            // distribute rounding remainder to highest-ranked winner
+            uint256 remainder = BASIS_POINTS - accumulatedBP;
+            if (remainder > 0 && K > 0) {
+                winners[0].normalizedShare += remainder;
+            }
         }
+
+        resultsFinalized = true;
+        phase = Phase.Finalized;
+        emit ResultsFinalized(block.timestamp);
+        emit PhaseUpdated(phase);
     }
 
-    function getAllApplicationId() external view returns (uint256[] memory) {
-        return applicationIds;
+    /**
+     * @notice Retrieves the vote submission of a given voter
+     * @param voter Address of the voter
+     * @return indices Array of applicant indices voted for
+     * @return shares Array of shares in basis points assigned to each index
+     */
+    function getSubmission(
+        address voter
+    )
+        external
+        view
+        returns (uint256[] memory indices, uint256[] memory shares)
+    {
+        VoteSubmission storage s = submissions[voter];
+        return (s.indices, s.shares);
     }
 
-    function depositMoney(uint256 amount) external nonReentrant {
-        // money is staked by the msg.sender..most probably
-        if (amount == 0) {
-            revert AmountMustBeGreaterThanZero();
-        }
-        if (!stakedToken.transferFrom(msg.sender, address(this), amount)) {
-            revert TransferFailed(msg.sender, address(this), amount);
-        }
-        if (!isStaker[msg.sender]) {
-            isStaker[msg.sender] = true;
-            stakers.push(msg.sender);
-        }
-        staked[msg.sender] += amount;
-        emit amountDeposited(msg.sender, amount);
+    /**
+     * @notice Retrieves the number of winners
+     * @return The count of winners
+     */
+    function getWinnerCount() external view returns (uint256) {
+        return winners.length;
     }
 
-    function withdraw(uint256 amount) external nonReentrant {
-        if (amount == 0) {
-            revert AmountMustBeGreaterThanZero();
-        }
-        if (staked[msg.sender] < amount) {
-            revert InsufficientStakedBalance();
-        }
-        staked[msg.sender] -= amount;
-        if (!stakedToken.transfer(msg.sender, amount)) {
-            revert TransferFailed(address(this), msg.sender, amount);
-        }
-        emit withdrawn(msg.sender, amount);
+    /**
+     * @notice Retrieves details of a specific winner by index
+     * @param i Index of the winner in the winners array
+     * @return index Numeric index of the winning application
+     * @return applicant Address of the winning applicant
+     * @return normalizedShare Normalized share in basis points
+     * @return rawScore Aggregated raw score before normalization
+     */
+    function getWinner(
+        uint256 i
+    )
+        external
+        view
+        returns (
+            uint256 index,
+            address applicant,
+            uint256 normalizedShare,
+            uint256 rawScore
+        )
+    {
+        Winner storage w = winners[i];
+        return (w.index, w.applicant, w.normalizedShare, w.rawScore);
     }
 
-    // Notes to understand the snapshot part
-
-    // Now we will write the codes , for snapshot functions, which are, used to snapshot staker balances
-    // Called when voting starts. Freezes voting power for the round.
-    // In voting, not everyone has same power
-    // more the amount, more the votingg power.
-    // So when the voting starts, we freeze the voting power, in order to avoid problems in votings.
-
-    function _snapshotStakes() internal {
-        uint256 total = 0;
-
-        for (uint256 i = 0; i < stakers.length; i++) {
-            address staker = stakers[i];
-            uint256 balance = staked[staker];
-            snapshotBalance[staker] = balance;
-            total += balance;
-        }
-        totalSnapshotVotingPower = total;
-    }
-
-    modifier inVotingPhase() {
-        if (
-            votingStartTime > 0 &&
-            block.timestamp >= votingStartTime &&
-            block.timestamp <= votingEndTime
-        ) {
-            _;
-        } else {
-            revert VotingPhaseNotGoingOn();
-        }
-    }
-
-    function vote(uint256 applicationId, bool support) external inVotingPhase {
-        if (!applications[applicationId].exists) {
-            revert ApplicationDoesNotExist();
-        }
-        if (hasVoted[applicationId][msg.sender]) {
-            revert AlreadyVoted();
-        }
-        uint256 votingPower = snapshotBalance[msg.sender];
-        if (votingPower == 0) {
-            revert NoVotingPower();
-        }
-        hasVoted[applicationId][msg.sender] = true;
-        if (support) {
-            applications[applicationId].yesWeight += votingPower;
-        } else {
-            applications[applicationId].noWeight += votingPower;
-        }
-        emit voted(applicationId, msg.sender, support, votingPower);
+    // Fallback helpers for external tooling
+    function getAggregatedScore(uint256 idx) external view returns (uint256) {
+        return aggregatedScores[idx];
     }
 }

@@ -107,6 +107,15 @@ contract YieldDonating is BaseStrategy {
         tokenizedStrategy.withdraw(_amount, msg.sender, msg.sender);
     }
 
+    /**
+     * @notice Harvests yield and donates it to the donation address(payment splitter contract)
+     * @dev Calls the report function of the tokenized strategy to harvest yield, which in turn calls
+     *      the harvestAndReport function of the base strategy contract
+     */
+    function transferYieldToDonationAddress() public {
+        tokenizedStrategy.report();
+    }
+
     // x-----------------------------------------------   Internal Override Functions   -----------------------------------------------x
 
     /**
