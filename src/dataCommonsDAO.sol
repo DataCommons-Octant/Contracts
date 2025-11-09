@@ -54,6 +54,7 @@ contract DataCommonsDAO is Ownable, ReentrancyGuard {
     uint256 public votingEnd; // timestamp at which voting ends
     uint256 public maxWinners; // max number of winners to select
     uint256 public maxApplications; // max number of applications (0 = unlimited)
+    address private immutable paymentSplitterAddress; // address of the payment splitter contract
 
     Phase public phase;
 
@@ -100,7 +101,8 @@ contract DataCommonsDAO is Ownable, ReentrancyGuard {
         uint256 _applicationEnd,
         uint256 _votingEnd,
         uint256 _maxWinners,
-        uint256 _maxApplications
+        uint256 _maxApplications,
+        address _paymentSplitterAddress
     ) Ownable(msg.sender) {
         require(_applicationStart < _applicationEnd, "start < end");
         require(_applicationEnd < _votingEnd, "app end < vote end");
@@ -111,6 +113,7 @@ contract DataCommonsDAO is Ownable, ReentrancyGuard {
         votingEnd = _votingEnd;
         maxWinners = _maxWinners;
         maxApplications = _maxApplications;
+        paymentSplitterAddress = _paymentSplitterAddress;
 
         phase = Phase.Idle;
     }
@@ -385,6 +388,17 @@ contract DataCommonsDAO is Ownable, ReentrancyGuard {
         phase = Phase.Finalized;
         emit ResultsFinalized(block.timestamp);
         emit PhaseUpdated(phase);
+
+        // logic to add the payees to the payment splitter contract
+        address[] memory payees = new address[](k);
+        uint256[] memory sharesBP = new uint256[](k);
+
+        for (uint256 i = 0; i < K; ++i) {
+            payees[i] = winners[i].applicant;
+            sharesBP[i] = winners[i].normalizedShare;
+        }
+
+        PaymentSplitter(paymentSplitterAddress).initialize(payees, sharesBP);
     }
 
     /**

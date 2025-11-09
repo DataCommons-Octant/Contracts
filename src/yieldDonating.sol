@@ -3,8 +3,10 @@ pragma solidity >=0.8.25;
 
 import {BaseStrategy} from "../lib/octant-v2-core/src/core/BaseStrategy.sol";
 import {YieldDonatingTokenizedStrategy} from "../lib/octant-v2-core/src/strategies/yieldDonating/YieldDonatingTokenizedStrategy.sol";
+import {PaymentSplitter} from "../lib/octant-v2-core/src/core/PaymentSplitter.sol";
 import {SafeERC20} from "../lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import {ERC20} from "../lib/openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
+import {IERC20} from "../lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 
 /**
  * @notice Interface for a generic yield source (e.g., Aave, Compound)
@@ -45,6 +47,7 @@ contract YieldDonating is BaseStrategy {
     IYieldSource yieldSource; // The yield source (e.g., Aave) where funds are deployed
     YieldDonatingTokenizedStrategy tokenizedStrategy; // The associated tokenized strategy contract
     address public immutable aUSDC = address(0x0); // Aave interest bearing USDC token address on Ethereum mainnet(to be replaced with actual address)
+    address private immutable paymentSplitterAddress; // Address of the payment splitter contract for donations
 
     /** @notice Constructor for the YieldDonating strategy
      * @param _yieldSource The address of the yield source contract
@@ -83,6 +86,7 @@ contract YieldDonating is BaseStrategy {
         tokenizedStrategy = YieldDonatingTokenizedStrategy(
             _tokenizedStrategyAddress
         );
+        paymentSplitterAddress = _donationAddress;
     }
 
     // x-----------------------------------------------   Public Write Functions   ----------------------------------------------------x
@@ -114,6 +118,15 @@ contract YieldDonating is BaseStrategy {
      */
     function transferYieldToDonationAddress() public {
         tokenizedStrategy.report();
+    }
+
+    /**
+     * @notice Claims payment from the payment splitter contract
+     * @dev Allows a payee to claim their share of the payments from the payment splitter
+     */
+    function claimPayment() public {
+        IERC20 token = IERC20(asset);
+        PaymentSplitter(paymentSplitterAddress).release(token, msg.sender);
     }
 
     // x-----------------------------------------------   Internal Override Functions   -----------------------------------------------x
