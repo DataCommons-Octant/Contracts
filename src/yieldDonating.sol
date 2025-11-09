@@ -46,7 +46,7 @@ contract YieldDonating is BaseStrategy {
 
     IYieldSource yieldSource; // The yield source (e.g., Aave) where funds are deployed
     YieldDonatingTokenizedStrategy tokenizedStrategy; // The associated tokenized strategy contract
-    address public immutable aUSDC = address(0x0); // Aave interest bearing USDC token address on Ethereum mainnet(to be replaced with actual address)
+    address public immutable aUSDC = 0x98C23E9d8f34FEFb1B7BD6a91B7FF122F4e16F5c; // Aave interest bearing USDC token address on Ethereum mainnet(to be replaced with actual address)
     address private immutable paymentSplitterAddress; // Address of the payment splitter contract for donations
 
     /** @notice Constructor for the YieldDonating strategy
@@ -126,7 +126,10 @@ contract YieldDonating is BaseStrategy {
      */
     function claimPayment() public {
         IERC20 token = IERC20(asset);
-        PaymentSplitter(paymentSplitterAddress).release(token, msg.sender);
+        PaymentSplitter(payable(paymentSplitterAddress)).release(
+            token,
+            msg.sender
+        );
     }
 
     // x-----------------------------------------------   Internal Override Functions   -----------------------------------------------x

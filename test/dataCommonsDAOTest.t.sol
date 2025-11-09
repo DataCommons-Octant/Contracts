@@ -35,7 +35,8 @@ contract DataCommonsDAOTest is Test {
             applicationEnd,
             votingEnd,
             2, // maxWinners
-            10 // maxApplications
+            10, // maxApplications
+            address(0) // paymentSplitterAddress
         );
     }
 

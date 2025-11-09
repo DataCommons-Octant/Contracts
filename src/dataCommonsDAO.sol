@@ -3,6 +3,7 @@ pragma solidity >=0.8.25;
 
 import {Ownable} from "../lib/openzeppelin-contracts/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "../lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
+import {PaymentSplitter} from "../lib/octant-v2-core/src/core/PaymentSplitter.sol";
 
 contract DataCommonsDAO is Ownable, ReentrancyGuard {
     uint16 public constant BASIS_POINTS = 10000; // 100.00%
@@ -390,15 +391,18 @@ contract DataCommonsDAO is Ownable, ReentrancyGuard {
         emit PhaseUpdated(phase);
 
         // logic to add the payees to the payment splitter contract
-        address[] memory payees = new address[](k);
-        uint256[] memory sharesBP = new uint256[](k);
+        address[] memory payees = new address[](K);
+        uint256[] memory sharesBP = new uint256[](K);
 
         for (uint256 i = 0; i < K; ++i) {
             payees[i] = winners[i].applicant;
             sharesBP[i] = winners[i].normalizedShare;
         }
 
-        PaymentSplitter(paymentSplitterAddress).initialize(payees, sharesBP);
+        PaymentSplitter(payable(paymentSplitterAddress)).initialize(
+            payees,
+            sharesBP
+        );
     }
 
     /**
